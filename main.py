@@ -1,36 +1,43 @@
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
-import sqlite3
+import psycopg
+import os
+from dotenv import load_dotenv
+
+load_dotenv()  # reads your .env file and loads DATABASE_URL
 
 app = FastAPI()
 
+DATABASE_URL = os.environ["DATABASE_URL"]
+
 # ---- Database setup ----
 def get_db():
-    conn = sqlite3.connect("tasks.db")
-    conn.row_factory = sqlite3.Row  # lets us access columns by name, like a dict
-    return conn
+    return psycopg.connect(DATABASE_URL)
 
 def init_db():
     conn = get_db()
-    conn.execute("""
+    cur = conn.cursor()
+    cur.execute("""
         CREATE TABLE IF NOT EXISTS tasks (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id SERIAL PRIMARY KEY,
             title TEXT NOT NULL,
-            done BOOLEAN NOT NULL DEFAULT 0
+            done BOOLEAN NOT NULL DEFAULT FALSE
         )
     """)
-    count = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
+    cur.execute("SELECT COUNT(*) FROM tasks")
+    count = cur.fetchone()[0]
     if count == 0:
-        conn.execute("INSERT INTO tasks (title, done) VALUES (?, ?)", ("Buy milk", 0))
-        conn.execute("INSERT INTO tasks (title, done) VALUES (?, ?)", ("Walk the dog", 0))
-        conn.execute("INSERT INTO tasks (title, done) VALUES (?, ?)", ("Finish assignment", 1))
+        cur.execute("INSERT INTO tasks (title, done) VALUES (%s, %s)", ("Buy milk", False))
+        cur.execute("INSERT INTO tasks (title, done) VALUES (%s, %s)", ("Walk the dog", False))
+        cur.execute("INSERT INTO tasks (title, done) VALUES (%s, %s)", ("Finish assignment", True))
     conn.commit()
+    cur.close()
     conn.close()
 
 init_db()
 
 def row_to_dict(row):
-    return {"id": row["id"], "title": row["title"], "done": bool(row["done"])}
+    return {"id": row[0], "title": row[1], "done": row[2]}
 
 # ---- Root & health ----
 @app.get("/")
@@ -45,14 +52,20 @@ def health_check():
 @app.get("/tasks")
 def get_tasks():
     conn = get_db()
-    rows = conn.execute("SELECT * FROM tasks").fetchall()
+    cur = conn.cursor()
+    cur.execute("SELECT id, title, done FROM tasks")
+    rows = cur.fetchall()
+    cur.close()
     conn.close()
     return [row_to_dict(r) for r in rows]
 
 @app.get("/tasks/{task_id}")
 def get_task(task_id: int):
     conn = get_db()
-    row = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    cur = conn.cursor()
+    cur.execute("SELECT id, title, done FROM tasks WHERE id = %s", (task_id,))
+    row = cur.fetchone()
+    cur.close()
     conn.close()
     if row is None:
         return JSONResponse(status_code=404, content={"error": f"Task {task_id} not found"})
@@ -65,38 +78,55 @@ def create_task(payload: dict):
     if not title:
         return JSONResponse(status_code=400, content={"error": "Title is required"})
     conn = get_db()
-    cursor = conn.execute("INSERT INTO tasks (title, done) VALUES (?, ?)", (title, 0))
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT INTO tasks (title, done) VALUES (%s, %s) RETURNING id, title, done",
+        (title, False)
+    )
+    row = cur.fetchone()
     conn.commit()
-    new_id = cursor.lastrowid
+    cur.close()
     conn.close()
-    return {"id": new_id, "title": title, "done": False}
+    return row_to_dict(row)
 
 # ---- Update ----
 @app.put("/tasks/{task_id}")
 def update_task(task_id: int, payload: dict):
     conn = get_db()
-    row = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    cur = conn.cursor()
+    cur.execute("SELECT id, title, done FROM tasks WHERE id = %s", (task_id,))
+    row = cur.fetchone()
     if row is None:
+        cur.close()
         conn.close()
         return JSONResponse(status_code=404, content={"error": f"Task {task_id} not found"})
 
-    new_title = payload.get("title", row["title"])
-    new_done = payload.get("done", bool(row["done"]))
+    new_title = payload.get("title", row[1])
+    new_done = payload.get("done", row[2])
 
-    conn.execute("UPDATE tasks SET title = ?, done = ? WHERE id = ?", (new_title, int(new_done), task_id))
+    cur.execute(
+        "UPDATE tasks SET title = %s, done = %s WHERE id = %s RETURNING id, title, done",
+        (new_title, new_done, task_id)
+    )
+    updated = cur.fetchone()
     conn.commit()
+    cur.close()
     conn.close()
-    return {"id": task_id, "title": new_title, "done": new_done}
+    return row_to_dict(updated)
 
 # ---- Delete ----
 @app.delete("/tasks/{task_id}", status_code=204)
 def delete_task(task_id: int):
     conn = get_db()
-    row = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    cur = conn.cursor()
+    cur.execute("SELECT id FROM tasks WHERE id = %s", (task_id,))
+    row = cur.fetchone()
     if row is None:
+        cur.close()
         conn.close()
         return JSONResponse(status_code=404, content={"error": f"Task {task_id} not found"})
-    conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
+    cur.execute("DELETE FROM tasks WHERE id = %s", (task_id,))
     conn.commit()
+    cur.close()
     conn.close()
     return
